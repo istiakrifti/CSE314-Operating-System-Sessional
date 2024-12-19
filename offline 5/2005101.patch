@@ -1,0 +1,657 @@
+diff --git a/Makefile b/Makefile
+index 62fd0f8..0da83ea 100644
+--- a/Makefile
++++ b/Makefile
+@@ -139,6 +139,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_threads\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..37739eb 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -106,6 +106,10 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             thread_create(uint64 fcn_addr, uint64 arg_addr, uint64 stack_addr);
++int             thread_join(int thread_id);
++void            thread_exit(void);
++void            thread_freepagetable(pagetable_t pagetable, uint64 sz);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -173,6 +177,9 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             uvmmirror(pagetable_t old, pagetable_t new, uint64 sz);
++int             uvm_range_mirror(pagetable_t old, pagetable_t new, uint64 szOld, uint64 szNew);
++void            freewalk(pagetable_t pagetable);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..36b0abf 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -10,6 +10,8 @@ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+ 
++struct spinlock memlocks[NPROC];
++
+ struct proc *initproc;
+ 
+ int nextpid = 1;
+@@ -51,6 +53,12 @@ procinit(void)
+   
+   initlock(&pid_lock, "nextpid");
+   initlock(&wait_lock, "wait_lock");
++
++  struct spinlock *lk;
++  for(lk = memlocks; lk < &memlocks[NPROC]; lk++){
++    initlock(lk, "memlock");
++  }
++
+   for(p = proc; p < &proc[NPROC]; p++) {
+       initlock(&p->lock, "proc");
+       p->state = UNUSED;
+@@ -111,6 +119,8 @@ allocproc(void)
+ {
+   struct proc *p;
+ 
++  int i = 0;
++
+   for(p = proc; p < &proc[NPROC]; p++) {
+     acquire(&p->lock);
+     if(p->state == UNUSED) {
+@@ -118,6 +128,9 @@ allocproc(void)
+     } else {
+       release(&p->lock);
+     }
++
++    i++;
++
+   }
+   return 0;
+ 
+@@ -125,6 +138,10 @@ found:
+   p->pid = allocpid();
+   p->state = USED;
+ 
++  p->memlock = &memlocks[i];
++  p->is_thread = 0;
++  p->mem_id = p->pid;
++
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+     freeproc(p);
+@@ -158,8 +175,22 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
+-  if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++  // if(p->pagetable)
++  //   proc_freepagetable(p->pagetable, p->sz);
++  if(p->pagetable) {
++
++    if(p->is_thread == 0) {
++      acquire(p->memlock);
++      proc_freepagetable(p->pagetable, p->sz);
++      release(p->memlock);
++    }
++    else {
++      acquire(p->memlock);
++      thread_freepagetable(p->pagetable, p->sz);
++      release(p->memlock);
++    }
++
++  }
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -169,6 +200,8 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++  p->memlock = 0;
++  p->mem_id = 0;
+ }
+ 
+ // Create a user page table for a given process, with no user memory,
+@@ -215,6 +248,16 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+   uvmfree(pagetable, sz);
+ }
+ 
++void
++thread_freepagetable(pagetable_t pagetable, uint64 sz)
++{
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  if(sz > 0)
++    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 0);
++  freewalk(pagetable);
++}
++
+ // a user program that calls exec("/init")
+ // assembled from ../user/initcode.S
+ // od -t xC ../user/initcode
+@@ -262,15 +305,34 @@ growproc(int n)
+   uint64 sz;
+   struct proc *p = myproc();
+ 
++  acquire(p->memlock);
+   sz = p->sz;
+   if(n > 0){
+     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++      release(p->memlock);
+       return -1;
+     }
+   } else if(n < 0){
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
+   p->sz = sz;
++
++  struct proc *tmp;
++  for(tmp = proc; tmp < &proc[NPROC]; tmp++) {
++    if(tmp->pid != p->pid && tmp->mem_id == p->mem_id) {
++      if( n > 0) {
++        uvm_range_mirror(p->pagetable, tmp->pagetable, p->sz, tmp->sz);
++        tmp->sz = p->sz;
++      }
++      else if(n < 0) {
++        uvmunmap(tmp->pagetable, PGROUNDUP(p->sz), (PGROUNDUP(tmp->sz) - PGROUNDUP(p->sz))/PGSIZE, 0);
++        tmp->sz = p->sz;
++      }
++    }
++  }
++
++  release(p->memlock);
++
+   return 0;
+ }
+ 
+@@ -686,3 +748,144 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int
++thread_create(uint64 fcn, uint64 arg, uint64 stack)
++{
++  int i, pid;
++  struct proc *np;
++  struct proc *p = myproc();
++
++  // Allocate process.
++  if((np = allocproc()) == 0){
++    return -1;
++  }
++
++  // mirror user memory from parent to child thread.
++  acquire(p->memlock);
++  if(uvmmirror(p->pagetable, np->pagetable, p->sz) < 0){
++    release(p->memlock);
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++  np->sz = p->sz;
++  release(p->memlock);
++
++  // copy saved user registers.
++  *(np->trapframe) = *(p->trapframe);
++  np->trapframe->epc = fcn;
++  np->trapframe->sp = stack + PGSIZE;
++  np->trapframe->sp -= (np->trapframe->sp) % 16;
++  np->trapframe->ra = 0xffffffff;
++  np->trapframe->a0 = arg;
++
++  np->is_thread = 1;
++
++  // increment reference counts on open file descriptors.
++  for(i = 0; i < NOFILE; i++)
++    if(p->ofile[i])
++      np->ofile[i] = filedup(p->ofile[i]);
++  np->cwd = idup(p->cwd);
++
++  safestrcpy(np->name, p->name, sizeof(p->name));
++
++  pid = np->pid;
++
++  release(&np->lock);
++
++  acquire(&wait_lock);
++  np->parent = p;
++  np->mem_id = p->mem_id;
++  np->memlock = p->memlock;
++  release(&wait_lock);
++
++  acquire(&np->lock);
++  np->state = RUNNABLE;
++  release(&np->lock);
++
++  return pid;
++}
++
++
++int
++thread_join(int thread_id)
++{
++  struct proc *pp;
++  int havekids, pid;
++  struct proc *p = myproc();
++  void* chan;
++
++  acquire(&wait_lock);
++
++  for(;;){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(pp = proc; pp < &proc[NPROC]; pp++){
++      if(pp->pid == thread_id && pp->mem_id == p->mem_id){
++        // make sure the child isn't still in exit() or swtch().
++        acquire(&pp->lock);
++        chan = (void*) &pp->pid;
++
++        havekids = 1;
++        if(pp->state == ZOMBIE && pp->is_thread){
++          // Found one.
++          pid = pp->pid;
++          // if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
++          //                         sizeof(pp->xstate)) < 0) {
++          //   release(&pp->lock);
++          //   release(&wait_lock);
++          //   return -1;
++          // }
++          freeproc(pp);
++          release(&pp->lock);
++          release(&wait_lock);
++          return pid;
++        }
++        release(&pp->lock);
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || killed(p)){
++      release(&wait_lock);
++      return -1;
++    }
++
++    // Wait for a child to exit.
++    sleep(chan, &wait_lock);  //DOC: wait-sleep
++  }
++}
++
++void
++thread_exit(void)
++{
++  struct proc *p = myproc();
++
++  if(p == initproc)
++    panic("init exiting");
++
++  // Close all open files.
++  for(int fd = 0; fd < NOFILE; fd++){
++    if(p->ofile[fd]){
++      struct file *f = p->ofile[fd];
++      fileclose(f);
++      p->ofile[fd] = 0;
++    }
++  }
++
++  begin_op();
++  iput(p->cwd);
++  end_op();
++  p->cwd = 0;
++
++  acquire(&wait_lock);
++  reparent(p);
++  wakeup((void*)&p->pid);
++  acquire(&p->lock);
++  p->state = ZOMBIE;
++  release(&wait_lock);
++
++  sched();
++  panic("zombie exit");
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..ccb1e78 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,8 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  
++  struct spinlock* memlock;	   
++  int is_thread;               
++  int mem_id;                  
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..d687ffd 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_thread_create(void);
++extern uint64 sys_thread_join(void);
++extern uint64 sys_thread_exit(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +129,9 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_thread_create] sys_thread_create,
++[SYS_thread_join] sys_thread_join,
++[SYS_thread_exit] sys_thread_exit,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..b6abf3a 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_thread_create 22
++#define SYS_thread_join 23
++#define SYS_thread_exit 24
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..04561c0 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -91,3 +91,31 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_thread_create(void)
++{
++  uint64 fcn;
++  argaddr(0, &fcn);
++  uint64 arg;
++  argaddr(1, &arg);
++  uint64 stack;
++  argaddr(2, &stack);
++
++  return thread_create(fcn, arg, stack);
++}
++
++uint64
++sys_thread_join(void)
++{
++  int thread_id;
++  argint(0, &thread_id);
++  return thread_join(thread_id);
++}
++
++uint64
++sys_thread_exit(void)
++{
++  thread_exit();
++  return 0;
++}
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 5c31e87..664943f 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -339,6 +339,68 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   return -1;
+ }
+ 
++int
++uvmmirror(pagetable_t old, pagetable_t new, uint64 sz)
++{
++  pte_t *pte;
++  uint64 pa, i;
++  uint flags;
++  //char *mem;
++
++  for(i = 0; i < sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmmirrorcopy: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmmirrorcopy: page not present");
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    // if((mem = kalloc()) == 0)
++    //   goto err;
++    // memmove(mem, (char*)pa, PGSIZE);
++    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
++      //kfree(mem);
++      goto err;
++    }
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
++
++int
++uvm_range_mirror(pagetable_t old, pagetable_t new, uint64 szO, uint64 szN)
++{
++  pte_t *pte;
++  uint64 pa, i;
++  uint flags;
++  //char *mem;
++
++  for(i = PGROUNDUP(szN); i < PGROUNDUP(szO); i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmrange_mirrorcopy: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmrange_mirrorcopy: page not present");
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    // if((mem = kalloc()) == 0)
++    //   goto err;
++    // memmove(mem, (char*)pa, PGSIZE);
++    // mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
++    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
++      //kfree(mem);
++      goto err;
++    }
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
+diff --git a/user/mutex.h b/user/mutex.h
+new file mode 100644
+index 0000000..20eb8fa
+--- /dev/null
++++ b/user/mutex.h
+@@ -0,0 +1,25 @@
++#include "kernel/types.h"
++#include "user.h"
++
++struct thread_mutex{
++  uint8 locked;       
++};
++
++void thread_mutex_init(struct thread_mutex *m)
++{
++  m->locked = 0;
++}
++
++void thread_mutex_lock(struct thread_mutex *m)
++{
++  while(__sync_lock_test_and_set(&m->locked, 1) != 0){
++    sleep(1);
++  }
++  __sync_synchronize();
++}
++
++void thread_mutex_unlock(struct thread_mutex *m)
++{
++  __sync_synchronize();
++  __sync_lock_release(&m->locked);
++}
+diff --git a/user/spinlock.h b/user/spinlock.h
+new file mode 100644
+index 0000000..3a5fb52
+--- /dev/null
++++ b/user/spinlock.h
+@@ -0,0 +1,23 @@
++// Mutual exclusion spin locks.
++#include "kernel/types.h"
++
++struct thread_spinlock{
++  uint8 locked;
++};
++
++void thread_spin_init(struct thread_spinlock *lk)
++{
++  lk->locked = 0;
++}
++
++void thread_spin_lock(struct thread_spinlock *lk)
++{
++  while(__sync_lock_test_and_set(&lk->locked, 1) != 0);
++  __sync_synchronize();
++}
++
++void thread_spin_unlock(struct thread_spinlock *lk)
++{
++  __sync_synchronize();
++  __sync_lock_release(&lk->locked);
++}
+\ No newline at end of file
+diff --git a/user/threads.c b/user/threads.c
+new file mode 100644
+index 0000000..5691dbe
+--- /dev/null
++++ b/user/threads.c
+@@ -0,0 +1,82 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "spinlock.h"
++#include "mutex.h"
++
++struct balance {
++    char name[32];
++    int amount;
++};
++
++volatile int total_balance = 0;
++
++volatile unsigned int delay (unsigned int d) {
++   unsigned int i;
++   for (i = 0; i < d; i++) {
++       __asm volatile( "nop" ::: );
++   }
++
++   return i;
++}
++
++struct thread_spinlock lock;
++struct thread_mutex mlock;
++struct thread_mutex plock;
++
++void do_work(void *arg){
++    int i;
++    int old;
++
++    struct balance *b = (struct balance*) arg;
++
++    thread_mutex_lock(&plock);
++    printf( "Starting do_work: s:%s\n", b->name);
++    thread_mutex_unlock(&plock);
++
++    for (i = 0; i < b->amount; i++) {
++        // lock and mlock will be implemented by you.
++         thread_spin_lock(&lock);
++         thread_mutex_lock(&mlock);
++         old = total_balance;
++         delay(100000);
++	    // if(old != total_balance)  printf("we will miss an update. old: %d total_balance: %d\n", old, total_balance);
++         total_balance = old + 1;
++         thread_spin_unlock(&lock);
++         thread_mutex_unlock(&mlock);
++
++    }
++    thread_mutex_lock(&plock);
++    printf( "Done s:%s\n", b->name);
++    thread_mutex_unlock(&plock);
++
++    thread_exit();
++    return;
++}
++
++int main(int argc, char *argv[]) {
++
++  struct balance b1 = {"b1", 3200};
++  struct balance b2 = {"b2", 2800};
++
++  thread_mutex_init(&mlock);
++  thread_mutex_init(&plock);
++  thread_spin_init(&lock);
++
++  void *s1, *s2;
++  int thread1, thread2, r1, r2;
++
++  s1 = malloc(4096); // 4096 is the PGSIZE defined in kernel/riscv.h
++  s2 = malloc(4096);
++
++  thread1 = thread_create(do_work, (void*)&b1, s1);
++  thread2 = thread_create(do_work, (void*)&b2, s2);
++
++  r1 = thread_join(thread1);
++  r2 = thread_join(thread2);
++
++  printf("Threads finished: (%d):%d, (%d):%d, shared balance:%d\n",
++      thread1, r1, thread2, r2, total_balance);
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 04013ca..d96d6bf 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int thread_create(void(*fcn)(void*), void *arg, void*stack);
++int thread_join(int thread_id);
++void thread_exit(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..a334aa7 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("thread_create");
++entry("thread_join");
++entry("thread_exit");
